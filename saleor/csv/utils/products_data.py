@@ -6,7 +6,7 @@ from django.conf import settings
 from django.db.models import Case, CharField
 from django.db.models import Value as V
 from django.db.models import When
-from django.db.models.functions import Concat
+from django.db.models.functions import Cast, Concat
 
 from ...attribute import AttributeInputType
 from ...core.utils import build_absolute_uri
@@ -52,6 +52,7 @@ def get_products_data(
                 default=V(""),
                 output_field=CharField(),
             ),
+            description_as_str=Cast("description", CharField()),
         )
         .order_by("pk", "variants__pk")
         .values(*product_export_fields)
@@ -134,9 +135,9 @@ def prepare_products_relations_data(
     for data in relations_data.iterator():
         pk = data.get("pk")
         collection = data.get("collections__slug")
-        image = data.pop("images__image", None)
+        image = data.pop("media__image", None)
 
-        result_data = add_image_uris_to_data(pk, image, "images__image", result_data)
+        result_data = add_image_uris_to_data(pk, image, "media__image", result_data)
         result_data = add_collection_info_to_data(pk, collection, result_data)
 
         result_data, data = handle_attribute_data(
@@ -219,10 +220,10 @@ def prepare_variants_relations_data(
 
     for data in relations_data.iterator():
         pk = data.get("variants__pk")
-        image = data.pop("variants__images__image", None)
+        image = data.pop("variants__media__image", None)
 
         result_data = add_image_uris_to_data(
-            pk, image, "variants__images__image", result_data
+            pk, image, "variants__media__image", result_data
         )
         result_data, data = handle_attribute_data(
             pk, data, attribute_ids, result_data, attribute_fields, "variant attribute"

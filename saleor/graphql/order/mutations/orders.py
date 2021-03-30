@@ -18,7 +18,7 @@ from ....order.actions import (
 )
 from ....order.error_codes import OrderErrorCode
 from ....order.utils import get_valid_shipping_methods_for_order, update_order_prices
-from ....payment import CustomPaymentChoices, PaymentError, TransactionKind, gateway
+from ....payment import PaymentError, TransactionKind, gateway
 from ....shipping import models as shipping_models
 from ...account.types import AddressInput
 from ...core.mutations import BaseMutation, ModelMutation
@@ -109,11 +109,11 @@ def clean_void_payment(payment):
 
 def clean_refund_payment(payment):
     clean_payment(payment)
-    if payment.gateway == CustomPaymentChoices.MANUAL:
+    if not payment.can_refund():
         raise ValidationError(
             {
                 "payment": ValidationError(
-                    "Manual payments can not be refunded.",
+                    "Payment cannot be refunded.",
                     code=OrderErrorCode.CANNOT_REFUND,
                 )
             }
@@ -218,7 +218,12 @@ class OrderUpdateShipping(BaseMutation):
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
-        order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
+        order = cls.get_node_or_error(
+            info,
+            data.get("id"),
+            only_type=Order,
+            qs=models.Order.objects.prefetch_related("lines"),
+        )
         data = data.get("input")
 
         if not data["shipping_method"]:
@@ -252,7 +257,7 @@ class OrderUpdateShipping(BaseMutation):
             field="shipping_method",
             only_type=ShippingMethod,
             qs=shipping_models.ShippingMethod.objects.prefetch_related(
-                "zip_code_rules"
+                "postal_code_rules"
             ),
         )
 
@@ -275,9 +280,13 @@ class OrderUpdateShipping(BaseMutation):
                 "shipping_tax_rate",
             ]
         )
-        update_order_prices(order, info.context.discounts)
+        update_order_prices(
+            order,
+            info.context.plugins,
+            info.context.site.settings.include_taxes_in_prices,
+        )
         # Post-process the results
-        order_shipping_updated(order)
+        order_shipping_updated(order, info.context.plugins)
         return OrderUpdateShipping(order=order)
 
 
@@ -350,7 +359,7 @@ class OrderCancel(BaseMutation):
     def perform_mutation(cls, _root, info, **data):
         order = cls.get_node_or_error(info, data.get("id"), only_type=Order)
         clean_order_cancel(order)
-        cancel_order(order=order, user=info.context.user)
+        cancel_order(order=order, user=info.context.user, manager=info.context.plugins)
         return OrderCancel(order=order)
 
 
@@ -386,7 +395,9 @@ class OrderMarkAsPaid(BaseMutation):
             order, info.context.user, None, clean_mark_order_as_paid, order
         )
 
-        mark_order_as_paid(order, info.context.user, transaction_reference)
+        mark_order_as_paid(
+            order, info.context.user, info.context.plugins, transaction_reference
+        )
         return OrderMarkAsPaid(order=order)
 
 
@@ -422,12 +433,20 @@ class OrderCapture(BaseMutation):
         clean_order_capture(payment)
 
         transaction = try_payment_action(
-            order, info.context.user, payment, gateway.capture, payment, amount
+            order,
+            info.context.user,
+            payment,
+            gateway.capture,
+            payment,
+            info.context.plugins,
+            amount,
         )
         # Confirm that we changed the status to capture. Some payment can receive
         # asynchronous webhook with update status
         if transaction.kind == TransactionKind.CAPTURE:
-            order_captured(order, info.context.user, amount, payment)
+            order_captured(
+                order, info.context.user, amount, payment, info.context.plugins
+            )
         return OrderCapture(order=order)
 
 
@@ -450,12 +469,17 @@ class OrderVoid(BaseMutation):
         clean_void_payment(payment)
 
         transaction = try_payment_action(
-            order, info.context.user, payment, gateway.void, payment
+            order,
+            info.context.user,
+            payment,
+            gateway.void,
+            payment,
+            info.context.plugins,
         )
         # Confirm that we changed the status to void. Some payment can receive
         # asynchronous webhook with update status
         if transaction.kind == TransactionKind.VOID:
-            order_voided(order, info.context.user, payment)
+            order_voided(order, info.context.user, payment, info.context.plugins)
         return OrderVoid(order=order)
 
 
@@ -491,13 +515,21 @@ class OrderRefund(BaseMutation):
         clean_refund_payment(payment)
 
         transaction = try_payment_action(
-            order, info.context.user, payment, gateway.refund, payment, amount
+            order,
+            info.context.user,
+            payment,
+            gateway.refund,
+            payment,
+            info.context.plugins,
+            amount,
         )
 
         # Confirm that we changed the status to refund. Some payment can receive
         # asynchronous webhook with update status
         if transaction.kind == TransactionKind.REFUND:
-            order_refunded(order, info.context.user, amount, payment)
+            order_refunded(
+                order, info.context.user, amount, payment, info.context.plugins
+            )
         return OrderRefund(order=order)
 
 
@@ -536,8 +568,9 @@ class OrderConfirm(ModelMutation):
         order.status = OrderStatus.UNFULFILLED
         order.save(update_fields=["status"])
         payment = order.get_last_payment()
+        manager = info.context.plugins
         if payment and payment.is_authorized and payment.can_capture():
-            gateway.capture(payment)
-            order_captured(order, info.context.user, payment.total, payment)
-        order_confirmed(order, info.context.user, send_confirmation_email=True)
+            gateway.capture(payment, info.context.plugins)
+            order_captured(order, info.context.user, payment.total, payment, manager)
+        order_confirmed(order, info.context.user, manager, send_confirmation_email=True)
         return OrderConfirm(order=order)

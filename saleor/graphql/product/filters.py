@@ -3,6 +3,7 @@ from typing import Dict, Iterable, List, Optional
 
 import django_filters
 import graphene
+from django.contrib.postgres.search import SearchQuery, SearchRank
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 from graphene_django.filter import GlobalIDFilter, GlobalIDMultipleChoiceFilter
@@ -13,10 +14,14 @@ from ...attribute.models import (
     Attribute,
 )
 from ...product.models import Category, Collection, Product, ProductType, ProductVariant
-from ...search.backends import picker
 from ...warehouse.models import Stock
 from ..channel.filters import get_channel_slug_from_filter_data
-from ..core.filters import EnumFilter, ListObjectTypeFilter, ObjectTypeFilter
+from ..core.filters import (
+    EnumFilter,
+    ListObjectTypeFilter,
+    MetadataFilterBase,
+    ObjectTypeFilter,
+)
 from ..core.types import ChannelFilterInputObjectType, FilterInputObjectType
 from ..core.types.common import IntRangeInput, PriceRangeInput
 from ..utils import get_nodes, resolve_global_ids_to_primary_keys
@@ -85,7 +90,10 @@ def filter_products_by_attributes_values(qs, queries: T_PRODUCT_FILTER_QUERIES):
 
 
 def filter_products_by_attributes(qs, filter_value):
-    queries = _clean_product_attributes_filter_input(filter_value)
+    try:
+        queries = _clean_product_attributes_filter_input(filter_value)
+    except ValueError:
+        return Product.objects.none()
     return filter_products_by_attributes_values(qs, queries)
 
 
@@ -209,10 +217,30 @@ def filter_stock_availability(qs, _, value):
     return qs
 
 
+def product_search(phrase):
+    """Return matching products for storefront views.
+
+        Name and description is matched using search vector.
+
+    Args:
+        phrase (str): searched phrase
+
+    """
+    query = SearchQuery(phrase, config="english")
+    vector = F("search_vector")
+    ft_in_description_or_name = Q(search_vector=query)
+
+    ft_by_sku = Q(variants__sku__search=phrase)
+    return (
+        Product.objects.annotate(rank=SearchRank(vector, query))
+        .filter((ft_in_description_or_name | ft_by_sku))
+        .order_by("-rank")
+    )
+
+
 def filter_search(qs, _, value):
     if value:
-        search = picker.pick_backend()
-        qs = qs.distinct() & search(value).distinct()
+        qs = product_search(value).distinct() & qs.distinct()
     return qs
 
 
@@ -290,7 +318,7 @@ class ProductStockFilterInput(graphene.InputObjectType):
     quantity = graphene.Field(IntRangeInput, required=False)
 
 
-class ProductFilter(django_filters.FilterSet):
+class ProductFilter(MetadataFilterBase):
     is_published = django_filters.BooleanFilter(method="filter_is_published")
     collections = GlobalIDMultipleChoiceFilter(method=filter_collections)
     categories = GlobalIDMultipleChoiceFilter(method=filter_categories)
@@ -341,7 +369,7 @@ class ProductFilter(django_filters.FilterSet):
         return _filter_is_published(queryset, name, value, channel_slug)
 
 
-class ProductVariantFilter(django_filters.FilterSet):
+class ProductVariantFilter(MetadataFilterBase):
     search = django_filters.CharFilter(
         method=filter_fields_containing_value("name", "product__name", "sku")
     )
@@ -352,7 +380,7 @@ class ProductVariantFilter(django_filters.FilterSet):
         fields = ["search", "sku"]
 
 
-class CollectionFilter(django_filters.FilterSet):
+class CollectionFilter(MetadataFilterBase):
     published = EnumFilter(
         input_class=CollectionPublished, method="filter_is_published"
     )
@@ -374,7 +402,7 @@ class CollectionFilter(django_filters.FilterSet):
         return queryset
 
 
-class CategoryFilter(django_filters.FilterSet):
+class CategoryFilter(MetadataFilterBase):
     search = django_filters.CharFilter(
         method=filter_fields_containing_value("slug", "name", "description")
     )
@@ -385,7 +413,7 @@ class CategoryFilter(django_filters.FilterSet):
         fields = ["search"]
 
 
-class ProductTypeFilter(django_filters.FilterSet):
+class ProductTypeFilter(MetadataFilterBase):
     search = django_filters.CharFilter(
         method=filter_fields_containing_value("name", "slug")
     )

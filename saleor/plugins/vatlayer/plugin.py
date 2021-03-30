@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     # flake8: noqa
     from ...account.models import Address
     from ...channel.models import Channel
-    from ...checkout import CheckoutLineInfo
-    from ...checkout.models import Checkout, CheckoutLine
+    from ...checkout.fetch import CheckoutInfo, CheckoutLineInfo
+    from ...checkout.models import Checkout
     from ...discount import DiscountInfo
     from ...order.models import Order, OrderLine
     from ...product.models import (
@@ -83,7 +83,7 @@ class VatlayerPlugin(BasePlugin):
 
     def calculate_checkout_total(
         self,
-        checkout: "Checkout",
+        checkout_info: "CheckoutInfo",
         lines: List["CheckoutLineInfo"],
         address: Optional["Address"],
         discounts: List["DiscountInfo"],
@@ -96,19 +96,19 @@ class VatlayerPlugin(BasePlugin):
         return (
             calculations.checkout_subtotal(
                 manager=manager,
-                checkout=checkout,
+                checkout_info=checkout_info,
                 lines=lines,
                 address=address,
                 discounts=discounts,
             )
             + calculations.checkout_shipping_price(
                 manager=manager,
-                checkout=checkout,
+                checkout_info=checkout_info,
                 lines=lines,
                 address=address,
                 discounts=discounts,
             )
-            - checkout.discount
+            - checkout_info.checkout.discount
         )
 
     def _get_taxes_for_country(self, country: Country):
@@ -128,7 +128,7 @@ class VatlayerPlugin(BasePlugin):
 
     def calculate_checkout_shipping(
         self,
-        checkout: "Checkout",
+        checkout_info: "CheckoutInfo",
         lines: List["CheckoutLineInfo"],
         address: Optional["Address"],
         discounts: List["DiscountInfo"],
@@ -141,11 +141,12 @@ class VatlayerPlugin(BasePlugin):
         taxes = None
         if address:
             taxes = self._get_taxes_for_country(address.country)
-        if not checkout.shipping_method:
+        if (
+            not checkout_info.shipping_method
+            or not checkout_info.shipping_method_channel_listings
+        ):
             return previous_value
-        shipping_price = checkout.shipping_method.channel_listings.get(
-            channel_id=checkout.channel_id
-        ).price
+        shipping_price = checkout_info.shipping_method_channel_listings.price
         return get_taxed_shipping_price(shipping_price, taxes)
 
     def calculate_order_shipping(
@@ -167,47 +168,91 @@ class VatlayerPlugin(BasePlugin):
 
     def calculate_checkout_line_total(
         self,
-        checkout: "Checkout",
-        checkout_line: "CheckoutLine",
+        checkout_info: "CheckoutInfo",
+        lines: List["CheckoutLineInfo"],
+        checkout_line_info: "CheckoutLineInfo",
+        address: Optional["Address"],
+        discounts: Iterable["DiscountInfo"],
+        previous_value: TaxedMoney,
+    ) -> TaxedMoney:
+        unit_price = self.__calculate_checkout_line_unit_price(
+            address,
+            discounts,
+            checkout_line_info.variant,
+            checkout_line_info.product,
+            checkout_line_info.collections,
+            checkout_info.channel,
+            checkout_line_info.channel_listing,
+            previous_value,
+        )
+        return (
+            unit_price * checkout_line_info.line.quantity
+            if unit_price is not None
+            else previous_value
+        )
+
+    def calculate_checkout_line_unit_price(
+        self,
+        checkout_info: "CheckoutInfo",
+        lines: Iterable["CheckoutLineInfo"],
+        checkout_line_info: "CheckoutLineInfo",
+        address: Optional["Address"],
+        discounts: Iterable["DiscountInfo"],
+        previous_value: TaxedMoney,
+    ) -> TaxedMoney:
+        unit_price = self.__calculate_checkout_line_unit_price(
+            address,
+            discounts,
+            checkout_line_info.variant,
+            checkout_line_info.product,
+            checkout_line_info.collections,
+            checkout_info.channel,
+            checkout_line_info.channel_listing,
+            previous_value,
+        )
+        return unit_price if unit_price is not None else previous_value
+
+    def __calculate_checkout_line_unit_price(
+        self,
+        address: Optional["Address"],
+        discounts: Iterable["DiscountInfo"],
         variant: "ProductVariant",
         product: "Product",
         collections: List["Collection"],
-        address: Optional["Address"],
         channel: "Channel",
         channel_listing: "ProductVariantChannelListing",
-        discounts: List["DiscountInfo"],
         previous_value: TaxedMoney,
-    ) -> TaxedMoney:
+    ):
         if self._skip_plugin(previous_value):
-            return previous_value
+            return
 
         price = variant.get_price(
             product, collections, channel, channel_listing, discounts
         )
         country = address.country if address else None
-        return (
-            self.__apply_taxes_to_product(product, price, country)
-            * checkout_line.quantity
-        )
+        return self.__apply_taxes_to_product(product, price, country)
 
     def calculate_order_line_unit(
-        self, order_line: "OrderLine", previous_value: TaxedMoney
+        self,
+        order: "Order",
+        order_line: "OrderLine",
+        variant: "ProductVariant",
+        product: "Product",
+        previous_value: TaxedMoney,
     ) -> TaxedMoney:
         if self._skip_plugin(previous_value):
             return previous_value
 
-        address = order_line.order.shipping_address or order_line.order.billing_address
+        address = order.shipping_address or order.billing_address
         country = address.country if address else None
-        variant = order_line.variant
         if not variant:
             return previous_value
-        return self.__apply_taxes_to_product(
-            variant.product, order_line.unit_price, country
-        )
+        return self.__apply_taxes_to_product(product, order_line.unit_price, country)
 
     def get_checkout_line_tax_rate(
         self,
-        checkout: "Checkout",
+        checkout_info: "CheckoutInfo",
+        lines: Iterable["CheckoutLineInfo"],
         checkout_line_info: "CheckoutLineInfo",
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],
@@ -219,6 +264,7 @@ class VatlayerPlugin(BasePlugin):
         self,
         order: "Order",
         product: "Product",
+        variant: "ProductVariant",
         address: Optional["Address"],
         previous_value: Decimal,
     ) -> Decimal:
@@ -239,7 +285,7 @@ class VatlayerPlugin(BasePlugin):
 
     def get_checkout_shipping_tax_rate(
         self,
-        checkout: "Checkout",
+        checkout_info: "CheckoutInfo",
         lines: Iterable["CheckoutLineInfo"],
         address: Optional["Address"],
         discounts: Iterable["DiscountInfo"],

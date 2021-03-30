@@ -1,4 +1,3 @@
-import json
 from unittest.mock import Mock
 
 import graphene
@@ -8,6 +7,7 @@ from graphql_relay import to_global_id
 from ....product.error_codes import CollectionErrorCode, ProductErrorCode
 from ....product.models import Collection, Product
 from ....product.tests.utils import create_image, create_pdf_file_with_image_ext
+from ....tests.utils import dummy_editorjs
 from ...tests.utils import get_graphql_content, get_multipart_request_body
 
 QUERY_COLLECTION = """
@@ -153,6 +153,7 @@ def test_collections_query(
                         name
                         slug
                         description
+                        descriptionJson
                         products {
                             totalCount
                         }
@@ -164,6 +165,7 @@ def test_collections_query(
 
     # query public collections only as regular user
     variables = {"channel": channel_USD.slug}
+    description = dummy_editorjs("Test description.", json_format=True)
     response = user_api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     edges = content["data"]["collections"]["edges"]
@@ -171,11 +173,50 @@ def test_collections_query(
     collection_data = edges[0]["node"]
     assert collection_data["name"] == published_collection.name
     assert collection_data["slug"] == published_collection.slug
-    assert collection_data["description"] == published_collection.description
+    assert collection_data["description"] == description
+    assert collection_data["descriptionJson"] == description
     assert (
         collection_data["products"]["totalCount"]
         == published_collection.products.count()
     )
+
+
+def test_collections_query_without_description(
+    user_api_client,
+    published_collection,
+    unpublished_collection,
+    permission_manage_products,
+    channel_USD,
+):
+    query = """
+        query Collections ($channel: String) {
+            collections(first:2, channel: $channel) {
+                edges {
+                    node {
+                        name
+                        slug
+                        description
+                        descriptionJson
+                    }
+                }
+            }
+        }
+    """
+
+    # query public collections only as regular user
+    variables = {"channel": channel_USD.slug}
+    collection = published_collection
+    collection.description = None
+    collection.save()
+    response = user_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    edges = content["data"]["collections"]["edges"]
+    assert len(edges) == 1
+    collection_data = edges[0]["node"]
+    assert collection_data["name"] == collection.name
+    assert collection_data["slug"] == collection.slug
+    assert collection_data["description"] is None
+    assert collection_data["descriptionJson"] == "{}"
 
 
 def test_collections_query_as_staff(
@@ -335,15 +376,14 @@ def test_filter_collection_products_by_multiple_attributes(
 
 CREATE_COLLECTION_MUTATION = """
         mutation createCollection(
-                $name: String!, $slug: String, $description: String,
-                $descriptionJson: JSONString, $products: [ID],
+                $name: String!, $slug: String,
+                $description: JSONString, $products: [ID],
                 $backgroundImage: Upload, $backgroundImageAlt: String) {
             collectionCreate(
                 input: {
                     name: $name,
                     slug: $slug,
                     description: $description,
-                    descriptionJson: $descriptionJson,
                     products: $products,
                     backgroundImage: $backgroundImage,
                     backgroundImageAlt: $backgroundImageAlt}) {
@@ -351,7 +391,6 @@ CREATE_COLLECTION_MUTATION = """
                     name
                     slug
                     description
-                    descriptionJson
                     products {
                         totalCount
                     }
@@ -388,13 +427,11 @@ def test_create_collection(
     image_alt = "Alt text for an image."
     name = "test-name"
     slug = "test-slug"
-    description = "test-description"
-    description_json = json.dumps({"content": "description"})
+    description = dummy_editorjs("description", True)
     variables = {
         "name": name,
         "slug": slug,
         "description": description,
-        "descriptionJson": description_json,
         "products": product_ids,
         "backgroundImage": image_name,
         "backgroundImageAlt": image_alt,
@@ -408,7 +445,6 @@ def test_create_collection(
     assert data["name"] == name
     assert data["slug"] == slug
     assert data["description"] == description
-    assert data["descriptionJson"] == description_json
     assert data["products"]["totalCount"] == len(product_ids)
     collection = Collection.objects.get(slug=slug)
     assert collection.background_image.file
@@ -483,7 +519,7 @@ def test_update_collection(
 ):
     query = """
         mutation updateCollection(
-            $name: String!, $slug: String!, $description: String, $id: ID!) {
+            $name: String!, $slug: String!, $description: JSONString, $id: ID!) {
 
             collectionUpdate(
                 id: $id, input: {name: $name, slug: $slug, description: $description}) {
@@ -496,7 +532,7 @@ def test_update_collection(
             }
         }
     """
-
+    description = dummy_editorjs("test description", True)
     mock_create_thumbnails = Mock(return_value=None)
     monkeypatch.setattr(
         (
@@ -508,7 +544,7 @@ def test_update_collection(
 
     name = "new-name"
     slug = "new-slug"
-    description = "new-description"
+    description = description
     variables = {
         "name": name,
         "slug": slug,

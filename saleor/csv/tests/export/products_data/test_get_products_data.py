@@ -1,9 +1,11 @@
+import json
+
 from measurement.measures import Weight
 
 from .....attribute.models import Attribute, AttributeValue
 from .....attribute.utils import associate_attribute_values_to_instance
 from .....channel.models import Channel
-from .....product.models import Product, ProductVariant, VariantImage
+from .....product.models import Product, ProductVariant, VariantMedia
 from .....warehouse.models import Warehouse
 from ....utils import ProductExportFields
 from ....utils.products_data import get_products_data
@@ -18,13 +20,18 @@ from .utils import (
 
 def test_get_products_data(product, product_with_image, collection, image, channel_USD):
     # given
+    product.description = {
+        "blocks": [
+            {"data": {"text": "This is an example description."}, "type": "paragraph"}
+        ]
+    }
     product.weight = Weight(kg=5)
-    product.save()
+    product.save(update_fields=["description", "weight"])
 
     collection.products.add(product)
 
     variant = product.variants.first()
-    VariantImage.objects.create(variant=variant, image=product.images.first())
+    VariantMedia.objects.create(variant=variant, media=product.media.first())
 
     products = Product.objects.all()
     export_fields = set(
@@ -62,7 +69,7 @@ def test_get_products_data(product, product_with_image, collection, image, chann
         product_data = {
             "id": product.id,
             "name": product.name,
-            "description": product.description,
+            "description_as_str": json.dumps(product.description),
             "category__slug": product.category.slug,
             "product_type__name": product.product_type.name,
             "charge_taxes": product.charge_taxes,
@@ -76,10 +83,10 @@ def test_get_products_data(product, product_with_image, collection, image, chann
                 if product.weight
                 else ""
             ),
-            "images__image": (
+            "media__image": (
                 ""
-                if not product.images.all()
-                else "http://mirumee.com{}".format(product.images.first().image.url)
+                if not product.media.all()
+                else "http://mirumee.com{}".format(product.media.first().image.url)
             ),
         }
 
@@ -93,10 +100,10 @@ def test_get_products_data(product, product_with_image, collection, image, chann
         for variant in product.variants.all():
             data = {
                 "variants__sku": variant.sku,
-                "variants__images__image": (
+                "variants__media__image": (
                     ""
-                    if not variant.images.all()
-                    else "http://mirumee.com{}".format(variant.images.first().image.url)
+                    if not variant.media.all()
+                    else "http://mirumee.com{}".format(variant.media.first().image.url)
                 ),
                 "variant_weight": (
                     "{} g".foramt(int(variant.weight.value * 1000))
